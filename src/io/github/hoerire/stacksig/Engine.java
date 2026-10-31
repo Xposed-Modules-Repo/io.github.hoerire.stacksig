@@ -36,7 +36,7 @@ public final class Engine {
     private static final WeakHashMap<Object, Integer> LEVELS = new WeakHashMap<>();
     private static final java.util.HashSet<Class<?>> LEVEL_HOOKED = new java.util.HashSet<>();
 
-    private static XposedModule MODULE;
+    static XposedModule MODULE;
     private static boolean netCallbackInstalled;
 
     private Engine() {}
@@ -52,154 +52,14 @@ public final class Engine {
         ok += hookDarkChanged(m, cl);
         ok += hookVisibility(m);
         // 颜色交给系统（见 VStack 注释），这里不再干预
-        ok += hookNetSpeedInterval(m);
+        ok += Speed.hookSpeedValue(m, cl);
         ok += hookSpeedAlign(m, cl);
-        ok += hookIconOrder(m, cl);
-        ok += hookIconGap(m, cl);
+        ok += Order.hookIconOrder(m, cl);
+        ok += Spacing.hookIconGap(m, cl);
         return ok;
     }
 
-    // ==================== 图标间距 ====================
 
-    /**
-     * 所有普通格的左右 padding 基准。
-     *
-     * 整簇偏宽就往小调、偏窄就往大调 —— 只改这一个数。
-     * 不要按图标身份分别配值：图标显隐一变，缝就重排（蓝牙曾被当成月亮套错值）。
-     */
-    private static final int GAP_INSET_PX = 0;
-
-    /**
-     * 只压缩「信号 → WiFi」之间的缝，电池位置不动。
-     *
-     * StatusIconContainer.updateStates() 从右往左累加
-     *   child.getWidth() + paddingStart + paddingEnd
-     * 得出每格的 translationX。给 mobile_combo 加负的 paddingEnd，它和它左边的东西
-     * 都会整体右移，右侧的 WiFi / 电池纹丝不动 —— 这正是"只缩间距不挪电池"。
-     *
-     * updateStates 每次布局都会跑，所以挂在这里而不是一次性的 setPadding。
-     */
-    private static int hookIconGap(XposedModule m, ClassLoader cl) {
-        try {
-            Class<?> c = Class.forName(
-                    "com.android.systemui.statusbar.phone.StatusIconContainer", false, cl);
-            int n = 0;
-            Class<?> sic = Class.forName(
-                    "com.android.systemui.statusbar.phone.StatusIconContainer", false, cl);
-            Method st = sic.getDeclaredMethod("updateStates");
-            m.hook(st).intercept(new XposedInterface.Hooker() {
-                @Override public Object intercept(XposedInterface.Chain ch) throws Throwable {
-                    try { tightenGap((ViewGroup) ch.getThisObject()); } catch (Throwable ignore) {}
-                    return ch.proceed();
-                }
-            });
-            n++;
-            Method lo = sic.getDeclaredMethod("onLayout",
-                    boolean.class, int.class, int.class, int.class, int.class);
-            m.hook(lo).intercept(new XposedInterface.Hooker() {
-                @Override public Object intercept(XposedInterface.Chain ch) throws Throwable {
-                    return ch.proceed();
-                }
-            });
-            n++;
-            return n;
-        } catch (Throwable t) {
-            try { MODULE.log(android.util.Log.WARN, "StackSig", "iconGap hook failed: " + t); }
-            catch (Throwable ignore) {}
-            return 0;
-        }
-    }
-
-    /**
-     * 把所有可见图标的左右 padding 统一成同一个值，让相邻图标之间的缝隙恒定。
-     *
-     * 原厂各格的 padding 是各自不同的（网速 7px、信号 0、WiFi 0 …），所以图标多一个少一个
-     * 缝隙就变样。这里统一成 GAP_INSET_PX：左右各一份，相邻两格合计就是一条恒定缝。
-     * 只改 padding，不动任何 child 的顺序/尺寸，updateStates 照常算。
-     */
-    /** 模块编译期拿不到 SystemUI 的类，只能按类名判断（StatIconView / *StatusBarIconView / *combo） */
-    private static boolean isStatusIcon(View v) {
-        // 先按 id 名判断（mobile_combo / wifi_combo / network_speed 都在 id 上）
-        String id = entryName(v);
-        if (id != null) {
-            String k = id.toLowerCase();
-            if (k.contains("combo") || k.contains("network_speed")) return true;
-        }
-        try {
-            for (Class<?> c = v.getClass(); c != null; c = c.getSuperclass()) {
-                String n = c.getSimpleName();
-                if (n.contains("StatIconView") || n.contains("StatusBarIconView")) return true;
-            }
-        } catch (Throwable ignore) {}
-        return false;
-    }
-
-    private static void tightenGap(ViewGroup g) {
-        int nullRank = 0;
-        for (int i = 0; i < g.getChildCount(); i++) {
-            View v = g.getChildAt(i);
-            if (v.getVisibility() != View.VISIBLE) continue;
-            if (!isStatusIcon(v)) continue;
-            int[] pe = gapFor(v, nullRank++);
-            if (v.getPaddingLeft() != pe[0] || v.getPaddingRight() != pe[1]) {
-                v.setPadding(pe[0], v.getPaddingTop(), pe[1], v.getPaddingBottom());
-            }
-
-            // 早先的 equalize() 实验给网速留下过 translationX，会让它画到别处甚至看不见。
-            // 这里统一清掉，位置完全交给系统的 updateStates。
-            if (v.getTranslationX() != 0f) {
-                v.setTranslationX(0f);
-                v.invalidate();
-            }
-        }
-    }
-
-    /**
-     * 每格的左右 padding。除蓝牙外全部相同。
-     *
-     * 这里刻意**不做按图标身份的区分**：曾经给 nfc / alarm / zen / bluetooth 各配一组值，
-     * 结果左右增减一个图标（开蓝牙、开免打扰）缝就重排 —— 因为「某格到右邻的缝」
-     * 取决于右邻是谁，而右邻随时会变。统一成一个值后，图标增删只改变总宽。
-     */
-    private static int[] gapFor(View v, int nullRank) {
-        // 蓝牙右边紧挨信号格左上角的制式标，需要比其他格多留 1px
-        if (v.getId() == View.NO_ID) {
-            String slot = slotOf(v);
-            if (slot != null && slot.contains("bluetooth")) {
-                return new int[]{GAP_INSET_PX, GAP_INSET_PX + 1};
-            }
-        }
-        return new int[]{GAP_INSET_PX, GAP_INSET_PX};
-    }
-
-    /** 反射调 StatusIconDisplayable.getSlot()，拿不到返回 null */
-    private static String slotOf(View v) {
-        try {
-            Method md = null;
-            for (Class<?> c = v.getClass(); c != null && md == null; c = c.getSuperclass()) {
-                try { md = c.getDeclaredMethod("getSlot"); } catch (Throwable ignore) {}
-            }
-            // 多数实现把 getSlot() 声明在接口 StatusIconDisplayable 上，类里继承而来
-            if (md == null) {
-                for (Class<?> c = v.getClass(); c != null && md == null; c = c.getSuperclass()) {
-                    for (Class<?> itf : c.getInterfaces()) {
-                        try { md = itf.getMethod("getSlot"); break; } catch (Throwable ignore) {}
-                    }
-                }
-            }
-            if (md == null) return null;
-            md.setAccessible(true);
-            Object r = md.invoke(v);
-            return r instanceof String ? (String) r : null;
-        } catch (Throwable ignore) {
-            return null;
-        }
-    }
-
-    /**
-     * 系统真正给状态栏图标上色走的是 StatusBarIconView.onDarkChanged(area, darkIntensity, ...)。
-     * 在这之后立刻把我们的 drawable 重建，颜色就跟系统完全同步了。
-     */
     private static int hookDarkChanged(XposedModule m, ClassLoader cl) {
         try {
             Class<?> c = null;
@@ -485,60 +345,6 @@ public final class Engine {
         }, RETRY_DELAYS[n]);
     }
 
-    /**
-     * 网速指示器的刷新周期默认 1000ms（OplusNetworkSpeedControllerExImpl 用 Handler 自己排）。
-     * 把来自 netspeed 包的定时调用改成 500ms。
-     *
-     * 只对 delay 落在 900~1100ms 的调用做处理，其它一律原样放行，开销可以忽略。
-     */
-    // 500ms 采样会让数字在 0 与真实值之间来回跳（原厂 4 秒窗口是为了平滑），
-    // 取 1 秒：比原厂灵敏 4 倍，同时不至于读到瞬时 0
-    private static final long NETSPEED_INTERVAL = 1000L;
-
-    /** 调用栈里有没有 netspeed 包（只认它的排期，别的 4 秒定时不动） */
-    private static boolean fromNetSpeed() {
-        try {
-            StackTraceElement[] st = new Throwable().getStackTrace();
-            for (int i = 1; i < st.length && i < 24; i++) {
-                if (st[i].getClassName().contains("netspeed")) return true;
-            }
-        } catch (Throwable ignore) {}
-        return false;
-    }
-
-        private static int hookNetSpeedInterval(XposedModule m) {
-        // Handler 的所有排期最终都汇到 sendMessageAtTime(Message, long)。
-        // 只拦这一处，就能覆盖 postDelayed / sendEmptyMessageDelayed / postAtTime 全部写法。
-        try {
-            Method md = android.os.Handler.class.getDeclaredMethod(
-                    "sendMessageAtTime", android.os.Message.class, long.class);
-            m.hook(md).intercept(new XposedInterface.Hooker() {
-                @Override public Object intercept(XposedInterface.Chain c) throws Throwable {
-                    try {
-                        Object w = c.getArg(1);
-                        if (w instanceof Long) {
-                            long when = (Long) w;
-                            long d = when - android.os.SystemClock.uptimeMillis();
-                            // 实测原厂采样周期是 4 秒（getTotalByte dt≈4000），不是 1 秒；
-                            // 两档都接住，统一改成 500ms
-                            boolean hit = (d >= 800 && d <= 1200) || (d >= 3500 && d <= 4500);
-                            if (hit && fromNetSpeed()) {
-                                android.os.Handler h = (android.os.Handler) c.getThisObject();
-                                android.os.Message msg = (android.os.Message) c.getArg(0);
-                                return h.sendMessageAtTime(msg,
-                                        android.os.SystemClock.uptimeMillis() + NETSPEED_INTERVAL);
-                            }
-                        }
-                    } catch (Throwable ignore) {}
-                    return c.proceed();
-                }
-            });
-            return 1;
-        } catch (Throwable t) {
-            return 0;
-        }
-    }
-
         
     /** 主入口：找容器 → 取主/副卡 → 合成 */
     private static void stack(ImageView iv) {
@@ -657,6 +463,7 @@ public final class Engine {
             // 颜色由系统 tint 驱动，不需要逐帧比对
             startColorTicker(main);
             startBadgeTicker(main.getContext());
+            Speed.startSpeedTicker(main.getContext());
             main.setImageDrawable(composed);
             if (secondRoot != null) collapse(secondRoot);
             // 兜底：这个容器里凡是还带信号的兄弟节点（副卡另一份、制式图那一份）全收掉，
@@ -935,71 +742,6 @@ public final class Engine {
             }
         }
         return null;
-    }
-
-    // ==================== 图标顺序（对齐 ColorOS 17） ====================
-
-    /**
-     * ColorOS 16 的 config_statusBarIcons 里 wifi 排在 mobile 前面；
-     * ColorOS 17 把 mobile 提到了 wifi 前面，于是变成「信号 → WiFi」。
-     *
-     * StatusBarIconList 的构造函数直接吃这个 String[]，数组顺序就是显示顺序。
-     * 这里只在构造时交换 wifi / mobile 的下标，纯数据层操作，不碰视图树。
-     */
-    private static int hookIconOrder(XposedModule m, ClassLoader cl) {
-        try {
-            Class<?> c = Class.forName(
-                    "com.android.systemui.statusbar.phone.ui.StatusBarIconList", false, cl);
-            final java.lang.reflect.Constructor<?> ctor = c.getDeclaredConstructor(String[].class);
-            m.hook(ctor).intercept(new XposedInterface.Hooker() {
-                @Override
-                public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                    try {
-                        Object arg = chain.getArg(0);
-                        if (arg instanceof String[]) reorder((String[]) arg);
-                    } catch (Throwable ignore) {}
-                    return chain.proceed();
-                }
-            });
-            return 1;
-        } catch (Throwable t) {
-            try { MODULE.log(android.util.Log.WARN, "StackSig", "iconOrder hook failed: " + t); }
-            catch (Throwable ignore) {}
-            return 0;
-        }
-    }
-
-    /**
-     * 重排 icon 数组。
-     *
-     * 1. mobile 挪到 wifi 前（对齐 C17 的「信号 → WiFi」）；
-     * 2. zen（月亮）挪到 network_speed 前；
-     * 3. network_speed 提到 zen 之前——让网速成为这一簇最左的一格。
-     *    数字宽度（115 / 1.20M / 12.3）一直变，它站在最左边就只会往左长，
-     *    右边的闹钟/铃铛/月亮永远不会被挤动，也就不需要额外预留缓冲。
-     */
-    private static void reorder(String[] slots) {
-        moveBefore(slots, "mobile", "wifi");
-        moveBefore(slots, "zen", "wifi");
-        moveBefore(slots, "network_speed", "logging");
-        // 网速提到最左：越过 mute / ethernet / alarm_clock，成为整簇第一格
-    }
-
-    /** 把 slot 名为 what 的元素挪到 slot 名为 before 的元素之前；任一个找不到就原样不动 */
-    private static void moveBefore(String[] slots, String what, String before) {
-        int iWhat = -1, iBefore = -1;
-        for (int i = 0; i < slots.length; i++) {
-            String s = slots[i];
-            if (s == null) continue;
-            if (s.equals(what)) iWhat = i;
-            else if (s.equals(before)) iBefore = i;
-        }
-        if (iWhat < 0 || iBefore < 0) return;
-        if (iWhat < iBefore) return;             // 已经在前面
-        String v = slots[iWhat];
-        // [before ... what] -> [what, before ...]
-        for (int i = iWhat; i > iBefore; i--) slots[i] = slots[i - 1];
-        slots[iBefore] = v;
     }
 
     private static boolean isSelfOrDescendant(View root, View target) {
